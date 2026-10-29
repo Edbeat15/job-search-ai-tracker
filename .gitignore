@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Variables de entorno y credenciales
+.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+token.json
+client_secret*.json
+rclone.conf
+
+# Datos privados del tracker
+/data/*
+!/data/.gitkeep
+
+# Reportes generados
+/reportes/*
+!/reportes/.gitkeep
+
+# Respaldos de configuración del modelo
+/model/*_bkp
+
+# Logs y archivos temporales
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# Backup scripts and local Python cache
+/script/bkp/
+/script/__pycache__/
+/model/*_bkp
+
+# Local project configuration
+/config/local.sh
