@@ -478,16 +478,45 @@ The following roadmap describes project capabilities and possible future work. V
 
 ## 🤝 Contributing
 
-Contributions and suggestions are welcome.
+**Contributions and collaboration requests are welcome!**
 
-Before submitting changes:
+This project is currently maintained with controlled access while its documentation, configuration, and workflows are being reviewed. If you are interested in contributing, please contact the repository owner before requesting write access.
 
-1. Do not commit personal or confidential recruitment data.
-2. Use synthetic messages when testing classification rules.
-3. Keep credentials and local configuration outside the repository.
-4. Validate Python and Bash syntax.
-5. Document changes to the Google Apps Script, spreadsheet schema, and local export workflow.
-6. Keep the README synchronized with changes to folder names, spreadsheet names, and configuration options.
+### How to request collaboration
+
+Please contact me through my GitHub profile:
+
+**GitHub:** [@Edbeat15](https://github.com/Edbeat15)
+
+Include the following information in your request:
+
+- **GitHub username:** Your GitHub account.
+- **Introduction:** A brief description of your background and relevant experience.
+- **Area of interest:** The component or area you would like to work on, such as Python, Bash, Google Apps Script, Ollama/LLM classification, reporting, testing, or documentation.
+- **Proposed contribution:** The problem you want to solve, the improvement you suggest, or the issue you would like to investigate.
+- **Relevant experience:** Links to previous projects, contributions, or examples of your work, if available.
+
+Please explain what you intend to change and why it would benefit the project. You do not need to have contributed to an open-source project before to request collaboration.
+
+### Collaboration process
+
+1. Submit a collaboration request with the information above.
+2. Wait for the project owner to review your proposal.
+3. If approved, receive the minimum repository permissions required for the agreed contribution.
+4. Coordinate the scope of the work and review process before making changes.
+
+Access is granted on a case-by-case basis. A collaboration request does not guarantee repository access.
+
+### Security and project guidelines
+
+- Never commit credentials, API keys, access tokens, personal information, or private job-search data.
+- Keep local configuration files, datasets, generated reports, and other private information out of version control.
+- Do not introduce new dependencies, external services, or automated workflows without discussing them first.
+- Explain the purpose and impact of proposed changes, particularly changes involving data handling, external requests, or LLM processing.
+- Test changes before submitting them and document any new configuration requirements.
+- Respect the project's local-first and privacy-oriented design goals.
+
+The project owner reserves the right to approve, decline, limit, or revoke repository access to protect the project and its data.
 
 ## 📄 License
 
