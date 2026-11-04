@@ -47,3 +47,6 @@ rclone.conf
 
 # Local project configuration
 /config/local.sh
+
+#Unrelated Modelfile
+/model/Modelfile_granite4_2_coding

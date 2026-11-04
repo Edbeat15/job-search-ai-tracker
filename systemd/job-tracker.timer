@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Local AI Job Application Tracker daily
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+AccuracySec=1min
+Unit=job-tracker.service
+
+[Install]
+WantedBy=timers.target
