@@ -5,7 +5,7 @@ The repository includes a user-level systemd service and timer for running the l
 ## Prerequisites
 
 - Ubuntu/systemd user session.
-- The project is located at `~/MEGAsync/Documentos/Job_search/Job2026` (adjust `systemd/job-tracker.service` if your clone is elsewhere).
+- The project is located at `~/your path to job-search-ai-tracker` (adjust `systemd/job-tracker.service` if your clone is elsewhere).
 - `config/local.sh` exists and contains the local `BASE_DIR`, `RCLONE_REMOTE`, and `RCLONE_FILE_PATH` values.
 - `rclone` is configured for the same Linux user that owns the systemd user service.
 - Docker is running; the user can run `docker` without an interactive `sudo` prompt.
