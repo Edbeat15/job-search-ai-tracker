@@ -41,6 +41,7 @@ RAW_JSON_FILE = DATA_DIR / "job_emails.json"
 CLASSIFIED_JSON_FILE = DATA_DIR / "classified_jobs.json"
 PROCESSING_STATE_FILE = DATA_DIR / "processing_state.json"
 USER_ACTIONS_FILE = DATA_DIR / "user_actions.json"
+MANUAL_OVERRIDES_FILE = DATA_DIR / "manual_overrides.json"
 REPORT_FILE = REPORT_DIR / "reporte.html"
 
 OLLAMA_URL = os.getenv(
@@ -1857,6 +1858,9 @@ def save_classification(
     applications
 ):
 
+    for app in applications:
+        ensure_application_identity(app)
+
     payload = {
 
         "generated_at":
@@ -1893,6 +1897,113 @@ def save_classification(
     log(
         f"   {CLASSIFIED_JSON_FILE}"
     )
+
+
+# ============================================================
+# STABLE APPLICATION IDENTITY + MANUAL OVERRIDES
+# ============================================================
+
+def _source_thread_ids(app):
+    values = app.get("thread_ids", []) or []
+    if isinstance(values, str):
+        values = [values]
+    values = list(values) + [app.get("thread_id", "")]
+    return sorted({clean_text(value) for value in values if clean_text(value)})
+
+
+def ensure_application_identity(app):
+    """Assign a persistent ID once; edits to company/title must not change it."""
+    if not clean_text(app.get("legacy_application_id")):
+        legacy_identity = "|".join([
+            _normalized_identity_text(app.get("company")),
+            _normalized_identity_text(app.get("position")),
+        ])
+        app["legacy_application_id"] = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()[:20]
+    if clean_text(app.get("identity_uid")):
+        return app
+    source_ids = _source_thread_ids(app)
+    if source_ids:
+        seed = "threads:" + "|".join(source_ids)
+    else:
+        seed = "legacy:" + "|".join([
+            _normalized_identity_text(app.get("company")),
+            _normalized_identity_text(app.get("position")),
+            clean_text(app.get("last_activity")),
+        ])
+    app["identity_uid"] = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+    return app
+
+
+def load_manual_overrides():
+    if not MANUAL_OVERRIDES_FILE.exists():
+        return {}
+    try:
+        with open(MANUAL_OVERRIDES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        log("⚠️ No se pudo leer manual_overrides.json; se mantienen los nombres originales.")
+        return {}
+
+
+def save_manual_overrides(payload):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = MANUAL_OVERRIDES_FILE.with_suffix(MANUAL_OVERRIDES_FILE.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temporary, MANUAL_OVERRIDES_FILE)
+
+
+def apply_manual_overrides(applications, overrides=None):
+    """Apply user-defined canonical company/title before duplicate grouping."""
+    overrides = overrides if overrides is not None else load_manual_overrides()
+    for app in applications:
+        ensure_application_identity(app)
+        # After two records are manually consolidated, their former IDs remain
+        # aliases. Continue honoring those overrides on later incremental runs.
+        identity_keys = [app["identity_uid"]] + [
+            clean_text(value) for value in (app.get("identity_aliases", []) or [])
+            if clean_text(value)
+        ]
+        company = ""
+        position = ""
+        for identity_key in identity_keys:
+            override = overrides.get(identity_key, {}) or {}
+            if not isinstance(override, dict):
+                continue
+            company = clean_text(override.get("company")) or company
+            position = clean_text(override.get("position")) or position
+        if company:
+            app["company"] = company
+        if position:
+            app["position"] = position
+    return applications
+
+
+def set_manual_override(app, company, position):
+    """Persist a canonical identity for one stable application record."""
+    ensure_application_identity(app)
+    overrides = load_manual_overrides()
+    current = overrides.get(app["identity_uid"], {}) or {}
+    if not isinstance(current, dict):
+        current = {}
+    company = clean_text(company)
+    position = clean_text(position)
+    if company:
+        current["company"] = company
+    else:
+        current.pop("company", None)
+    if position:
+        current["position"] = position
+    else:
+        current.pop("position", None)
+    if current:
+        current["updated_at"] = datetime.now().isoformat()
+        overrides[app["identity_uid"]] = current
+    else:
+        overrides.pop(app["identity_uid"], None)
+    save_manual_overrides(overrides)
+    return overrides
 
 
 # ============================================================
@@ -1981,6 +2092,30 @@ def _same_vacancy_candidate(left, right):
 def _merge_duplicate_group(group):
     group.sort(key=lambda x: clean_text(x.get("last_activity", "")))
     merged = dict(group[-1])
+    # Keep the first/oldest group's stable ID when new emails join it.
+    for item in group:
+        ensure_application_identity(item)
+    primary_uid = group[0]["identity_uid"]
+    aliases = []
+    legacy_ids = []
+    for item in group:
+        legacy_id = clean_text(item.get("legacy_application_id"))
+        if legacy_id and legacy_id not in legacy_ids:
+            legacy_ids.append(legacy_id)
+        for old_id in item.get("legacy_application_ids", []) or []:
+            old_id = clean_text(old_id)
+            if old_id and old_id not in legacy_ids:
+                legacy_ids.append(old_id)
+        uid = clean_text(item.get("identity_uid"))
+        if uid and uid not in aliases:
+            aliases.append(uid)
+        for alias in item.get("identity_aliases", []) or []:
+            alias = clean_text(alias)
+            if alias and alias not in aliases:
+                aliases.append(alias)
+    merged["identity_uid"] = primary_uid
+    merged["identity_aliases"] = [uid for uid in aliases if uid != primary_uid]
+    merged["legacy_application_ids"] = legacy_ids
     evidence, message_ids, thread_ids = [], [], []
     for item in group:
         values = item.get("evidence", []) or []
@@ -2015,6 +2150,7 @@ def deduplicate_applications(applications):
     """Remove alert emails and consolidate exact/near-identical vacancy records conservatively."""
     candidates = []
     for app in applications:
+        ensure_application_identity(app)
         if _looks_like_linkedin_alert(app):
             continue
         if not clean_text(app.get("company")) or not clean_text(app.get("position")):
@@ -2060,49 +2196,59 @@ def status_class(
 # PLOTLY
 # ============================================================
 
-STATUS_CHART_CATEGORIES = [
-    "Applied", "Action Required · Pending", "Action Required · Completed",
-    "Action Required · Dismissed", "Interview · Pending", "Interview · Completed",
-    "Interview · Dismissed", "Rejected", "Job Offer", "Unrelated · Excluded",
-]
+STATUS_CHART_CATEGORIES = ["Pending", "Interview", "Applied", "Rejected", "Offer"]
 
 
-def create_status_chart(applications, actions=None):
-    """Build the status chart with follow-up progress represented as subcategories."""
+def get_total_submissions_count(applications, actions=None):
+    """Count all tracked submissions, excluding records manually marked unrelated.
+
+    Completed or dismissed follow-ups still count: those applications were submitted
+    and remain part of the overall application history.
+    """
+    actions = actions or {}
+    return sum(1 for app in applications if not is_application_unrelated(actions, app))
+
+
+def get_main_status_counts(applications, actions=None):
+    """Return the five dashboard categories after applying persistent user decisions.
+
+    Action_Required contributes to Pending unless completed or dismissed.
+    Interview remains Interview unless explicitly dismissed. Completed interviews
+    remain in the Interview stage; unrelated applications are excluded entirely.
+    """
     actions = actions or {}
     counts = {label: 0 for label in STATUS_CHART_CATEGORIES}
-
     for app in applications:
         if is_application_unrelated(actions, app):
-            counts["Unrelated · Excluded"] += 1
             continue
         status = clean_text(app.get("status"))
-        if status == "Applied":
+        if status == "Action_Required":
+            if not is_task_completed(actions, app, "action") and not is_task_dismissed(actions, app, "action"):
+                counts["Pending"] += 1
+        elif status == "Interview":
+            if not is_task_dismissed(actions, app, "interview"):
+                counts["Interview"] += 1
+        elif status == "Applied":
             counts["Applied"] += 1
         elif status == "Rejected":
             counts["Rejected"] += 1
         elif status == "Job_Offer":
-            counts["Job Offer"] += 1
-        elif status in ("Action_Required", "Interview"):
-            task = "action" if status == "Action_Required" else "interview"
-            prefix = "Action Required" if task == "action" else "Interview"
-            if is_task_completed(actions, app, task):
-                suffix = "Completed"
-            elif is_task_dismissed(actions, app, task):
-                suffix = "Dismissed"
-            else:
-                suffix = "Pending"
-            counts[f"{prefix} · {suffix}"] += 1
+            counts["Offer"] += 1
+    return counts
 
-    values = [counts[label] for label in STATUS_CHART_CATEGORIES]
-    fig = go.Figure(data=[go.Bar(x=STATUS_CHART_CATEGORIES, y=values, text=values, textposition="auto")])
+
+def create_status_chart(applications, actions=None):
+    """Build the consolidated five-category status chart."""
+    counts = get_main_status_counts(applications, actions)
+    labels = STATUS_CHART_CATEGORIES
+    values = [counts[label] for label in labels]
+    fig = go.Figure(data=[go.Bar(x=labels, y=values, text=values, textposition="auto")])
     fig.update_layout(
         title="Applications by Current Status",
-        xaxis_title="Status / follow-up progress",
+        xaxis_title="Current status",
         yaxis_title="Applications",
         template="plotly_white",
-        height=480,
-        xaxis={"tickangle": -25},
+        height=420,
     )
     return fig
 
@@ -2202,11 +2348,35 @@ def create_timeline_chart(
 # ============================================================
 
 def application_id(app):
-    identity = "|".join([
-        _normalized_identity_text(app.get("company")),
-        _normalized_identity_text(app.get("position")),
-    ])
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+    ensure_application_identity(app)
+    return hashlib.sha256(app["identity_uid"].encode("utf-8")).hexdigest()[:20]
+
+
+def application_action_ids(app):
+    ensure_application_identity(app)
+    ids = [application_id(app)]
+    aliases = app.get("identity_aliases", []) or []
+    for uid in aliases:
+        alias_id = hashlib.sha256(clean_text(uid).encode("utf-8")).hexdigest()[:20]
+        if alias_id not in ids:
+            ids.append(alias_id)
+    legacy_ids = list(app.get("legacy_application_ids", []) or [])
+    legacy_id = clean_text(app.get("legacy_application_id"))
+    if legacy_id:
+        legacy_ids.append(legacy_id)
+    for old_id in legacy_ids:
+        old_id = clean_text(old_id)
+        if old_id and old_id not in ids:
+            ids.append(old_id)
+    return ids
+
+
+def get_application_action_record(actions, app, task_name):
+    for app_id in application_action_ids(app):
+        record = (actions.get(app_id, {}) or {}).get(task_name, {}) or {}
+        if record:
+            return record
+    return {}
 
 
 def application_activity_key(app):
@@ -2239,24 +2409,24 @@ def load_user_actions():
 
 def save_user_actions(payload):
     os.makedirs(DATA_DIR, exist_ok=True)
-    temporary = USER_ACTIONS_FILE + ".tmp"
+    temporary = USER_ACTIONS_FILE.with_suffix(USER_ACTIONS_FILE.suffix + ".tmp")
     with open(temporary, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(temporary, USER_ACTIONS_FILE)
 
 
 def is_task_completed(actions, app, task_name):
-    record = (actions.get(application_id(app), {}) or {}).get(task_name, {}) or {}
+    record = get_application_action_record(actions, app, task_name)
     return bool(record.get("done")) and record.get("activity_key") == application_activity_key(app)
 
 
 def is_task_dismissed(actions, app, task_name):
-    record = (actions.get(application_id(app), {}) or {}).get(f"dismiss_{task_name}", {}) or {}
+    record = get_application_action_record(actions, app, f"dismiss_{task_name}")
     return bool(record.get("done")) and record.get("activity_key") == application_activity_key(app)
 
 
 def is_application_unrelated(actions, app):
-    record = (actions.get(application_id(app), {}) or {}).get("unrelated", {}) or {}
+    record = get_application_action_record(actions, app, "unrelated")
     return bool(record.get("done"))
 
 
@@ -2316,33 +2486,43 @@ def generate_html_report(applications):
             except OSError:
                 pass
 
-    counts = {status: 0 for status in ALLOWED_STATUSES}
-    unrelated_count = 0
-    for app in applications:
-        if is_application_unrelated(actions, app):
-            unrelated_count += 1
-            continue
-        status = clean_text(app.get("status"))
-        if status in counts:
-            counts[status] += 1
-
+    main_counts = get_main_status_counts(applications, actions)
+    total_submissions = get_total_submissions_count(applications, actions)
     status_chart_html = create_status_chart(applications, actions).to_html(full_html=False, include_plotlyjs=True, div_id="status-chart")
     timeline_chart_html = create_timeline_chart([app for app in applications if not is_application_unrelated(actions, app)]).to_html(full_html=False, include_plotlyjs=False)
-    completion_fig, completed_tasks, pending_tasks, dismissed_tasks = create_task_completion_chart(applications, actions)
-    completion_chart_html = completion_fig.to_html(full_html=False, include_plotlyjs=False, div_id="task-completion-chart")
-    completed_action_count, completed_interview_count = completed_tasks
-    pending_action_count, pending_interview_count = pending_tasks
-    dismissed_action_count, dismissed_interview_count = dismissed_tasks
-    active_application_count = len(applications) - unrelated_count
     sorted_apps = sorted(applications, key=lambda app: clean_text(app.get("last_activity", "")), reverse=True)
+
+    # Prioritize company groups by their most urgent vacancy. Pending Action_Required
+    # and pending Interview follow-ups come first, then offers/applied, then rejected,
+    # and finally completed/dismissed or otherwise non-pending records.
+    def vacancy_display_priority(app):
+        status = clean_text(app.get("status"))
+        if is_application_unrelated(actions, app):
+            return 5
+        if status == "Action_Required":
+            return 4 if (is_task_completed(actions, app, "action") or is_task_dismissed(actions, app, "action")) else 0
+        if status == "Interview":
+            return 4 if (is_task_completed(actions, app, "interview") or is_task_dismissed(actions, app, "interview")) else 0
+        if status in ("Applied", "Job_Offer"):
+            return 1
+        if status == "Rejected":
+            return 2
+        return 3
 
     company_groups = {}
     for app in sorted_apps:
         company = clean_text(app.get("company")) or "Unknown company"
         company_groups.setdefault(company, []).append(app)
 
+    def company_group_sort(item):
+        company, company_apps = item
+        return (min(vacancy_display_priority(app) for app in company_apps), company.casefold())
+
     company_sections = []
-    for company, company_apps in sorted(company_groups.items(), key=lambda item: item[0].casefold()):
+    for company, company_apps in sorted(company_groups.items(), key=company_group_sort):
+        # sorted_apps is already newest-first; Python's stable sort preserves that
+        # order inside each priority tier.
+        company_apps = sorted(company_apps, key=vacancy_display_priority)
         vacancy_items = []
         for app in company_apps:
             status = clean_text(app.get("status")) or "Unknown"
@@ -2358,16 +2538,23 @@ def generate_html_report(applications):
                 dismissed = is_task_dismissed(actions, app, task)
                 state_label = "✓ Completed" if done else "⊘ Dismissed" if dismissed else "○ Pending"
                 task_control = ' <span class="completion-mini">' + state_label + "</span>"
+            done_state = is_task_completed(actions, app, task) if task else False
+            dismissed_state = is_task_dismissed(actions, app, task) if task else False
             vacancy_items.append(
-                '<li><strong>{}</strong> <span class="status {}">{}</span>{} '
+                '<li data-app-id="{}" data-priority="{}" data-status="{}" data-task="{}" data-done="{}" data-dismissed="{}" data-unrelated="{}">'
+                '<strong>{}</strong> <span class="status {}">{}</span>{} '
                 '<span class="muted">Last activity: {}</span></li>'.format(
+                    esc(application_id(app)), vacancy_display_priority(app), esc(status), task,
+                    str(done_state).lower(), str(dismissed_state).lower(), str(is_unrelated).lower(),
                     esc(position), status_class(status), esc(status), task_control, esc(activity)
                 )
             )
+        pending_count = sum(1 for app in company_apps if vacancy_display_priority(app) == 0)
         company_sections.append(
-            '<details class="company-group" open><summary><strong>{}</strong>'
-            '<span class="company-count">{} vacancy/vacancies</span></summary><ul>{}</ul></details>'.format(
-                esc(company), len(company_apps), "".join(vacancy_items)
+            '<details class="company-group" open data-priority="{}"><summary><strong>{}</strong>'
+            '<span class="company-count">{} vacancy/vacancies · {} pending</span></summary><ul>{}</ul></details>'.format(
+                min(vacancy_display_priority(app) for app in company_apps),
+                esc(company), len(company_apps), pending_count, "".join(vacancy_items)
             )
         )
     company_groups_html = "\n".join(company_sections) or '<p class="muted">No applications to display.</p>'
@@ -2407,6 +2594,7 @@ def generate_html_report(applications):
             action_buttons.append(f'<button type="button" class="task-button {"done" if done else ""}" data-app-id="{app_id}" data-activity-key="{activity_key}" data-task="{task}" data-done="{str(done).lower()}">{task_label}</button>')
             dismiss_label = "Restore pending" if dismissed else "Dismiss pending"
             action_buttons.append(f'<button type="button" class="dismiss-button {"dismissed" if dismissed else ""}" data-app-id="{app_id}" data-activity-key="{activity_key}" data-task="dismiss_{task}" data-target-task="{task}" data-done="{str(dismissed).lower()}">{dismiss_label}</button>')
+        action_buttons.append(f'<button type="button" class="identity-button" data-app-id="{app_id}" data-company="{esc(company)}" data-position="{esc(position)}">Edit company / vacancy</button>')
         unrelated_label = "Restore to tracker" if is_unrelated else "Mark unrelated"
         action_buttons.append(f'<button type="button" class="unrelated-button {"excluded" if is_unrelated else ""}" data-app-id="{app_id}" data-activity-key="{activity_key}" data-task="unrelated" data-done="{str(is_unrelated).lower()}">{unrelated_label}</button>')
         if is_unrelated:
@@ -2456,7 +2644,7 @@ body {{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; mar
 .controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:12px 0 16px; }} .controls input {{ flex:1 1 280px; }}
 input {{ box-sizing:border-box; min-width:80px; width:100%; padding:8px; border:1px solid #dadce0; border-radius:6px; font:inherit; background:white; }}
 button {{ cursor:pointer; font:inherit; }} .clear-button {{ padding:8px 12px; border:1px solid #dadce0; border-radius:6px; background:#fff; }}
-.row-actions {{ display:flex; flex-direction:column; gap:6px; min-width:145px; }} .task-button,.dismiss-button,.unrelated-button {{ padding:7px 9px; border:1px solid #dadce0; border-radius:6px; background:#fff; font-size:12px; text-align:left; }} .task-button.done {{ background:#e6f4ea; border-color:#81c995; }} .dismiss-button.dismissed {{ background:#fef7e0; border-color:#f4c542; }} .unrelated-button.excluded {{ background:#fce8e6; border-color:#e6a09b; }} .completion-mini {{ font-size:12px; margin-left:6px; color:#666; }}
+.row-actions {{ display:flex; flex-direction:column; gap:6px; min-width:145px; }} .task-button,.dismiss-button,.unrelated-button,.identity-button {{ padding:7px 9px; border:1px solid #dadce0; border-radius:6px; background:#fff; font-size:12px; text-align:left; }} .task-button.done {{ background:#e6f4ea; border-color:#81c995; }} .dismiss-button.dismissed {{ background:#fef7e0; border-color:#f4c542; }} .unrelated-button.excluded {{ background:#fce8e6; border-color:#e6a09b; }} .completion-mini {{ font-size:12px; margin-left:6px; color:#666; }}
 table {{ width:100%; border-collapse:collapse; }} th {{ text-align:left; background:#f1f3f4; padding:9px; vertical-align:top; }} td {{ padding:10px; border-bottom:1px solid #eee; vertical-align:top; }}
 thead tr:first-child th {{ white-space:nowrap; }} .sort-button {{ border:0; background:transparent; font-weight:700; padding:2px 0; white-space:nowrap; }}
 .filter-row th {{ background:#fafafa; min-width:110px; }} .filter-row input {{ font-size:12px; padding:7px; }}
@@ -2466,71 +2654,138 @@ ul {{ margin:0; padding-left:18px; }} a {{ text-decoration:none; }} a:hover {{ t
 .company-group {{ background:#fff; border:1px solid #e5e7eb; border-radius:8px; margin:8px 0; padding:12px 14px; }}
 .company-group summary {{ cursor:pointer; display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; }} .company-group ul {{ margin-top:10px; }} .company-group li {{ margin:8px 0; }}
 .company-count {{ color:#666; font-size:13px; font-weight:400; }} #visible-count {{ color:#555; font-size:13px; }} .footer {{ margin-top:25px; color:#777; font-size:13px; }}
-#save-message {{ font-size:13px; }} @media(max-width:700px) {{ body {{ padding:12px; }} .chart,.panel,.table-container {{ padding:12px; }} }}
+#save-message {{ font-size:13px; }} .search-button {{ padding:8px 14px; border:1px solid #1a73e8; border-radius:6px; background:#1a73e8; color:#fff; font-weight:600; }}
+.visually-hidden {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
+.company-group[data-priority="0"] {{ border-left:5px solid #d97706; }}
+.company-group[data-priority="1"] {{ border-left:5px solid #2563eb; }}
+@media(max-width:700px) {{ body {{ padding:12px; }} .chart,.panel,.table-container {{ padding:12px; }} .controls {{ align-items:stretch; }} .controls button {{ flex:1 1 auto; }} }}
 </style></head><body><div class="container">
 <h1>Job Application Tracker</h1><div class="subtitle">Generated locally with Ollama / {esc(OLLAMA_MODEL)}<br>Generated: {esc(generated_at)}</div>
-<div class="cards"><div class="card"><div class="number" id="count-active-applications">{active_application_count}</div><div class="label">Active applications</div></div>
-<div class="card"><div class="number" id="count-applied">{counts['Applied']}</div><div class="label">Applied</div></div>
-<div class="card"><div class="number" id="count-action-required">{counts['Action_Required']}</div><div class="label">Action Required</div></div>
-<div class="card"><div class="number" id="count-interview">{counts['Interview']}</div><div class="label">Interview</div></div>
-<div class="card"><div class="number" id="count-rejected">{counts['Rejected']}</div><div class="label">Rejected</div></div>
-<div class="card"><div class="number" id="count-job-offer">{counts['Job_Offer']}</div><div class="label">Job Offer</div></div>
-<div class="card"><div class="number" id="count-unrelated">{unrelated_count}</div><div class="label">Excluded as unrelated</div></div>
-<div class="card"><div class="number" id="count-actions-completed">{completed_action_count}</div><div class="label">Actions completed</div></div>
-<div class="card"><div class="number" id="count-actions-pending">{pending_action_count}</div><div class="label">Actions pending</div></div>
-<div class="card"><div class="number" id="count-actions-dismissed">{dismissed_action_count}</div><div class="label">Actions dismissed</div></div>
-<div class="card"><div class="number" id="count-interviews-completed">{completed_interview_count}</div><div class="label">Interviews completed</div></div>
-<div class="card"><div class="number" id="count-interviews-pending">{pending_interview_count}</div><div class="label">Interviews pending</div></div>
-<div class="card"><div class="number" id="count-interviews-dismissed">{dismissed_interview_count}</div><div class="label">Interviews dismissed</div></div></div>
-<div class="chart">{status_chart_html}</div><div class="chart">{timeline_chart_html}</div><div class="chart">{completion_chart_html}</div>
+<div class="cards">
+<div class="card"><div class="number" id="count-total-submissions">{total_submissions}</div><div class="label">Total Submissions</div></div>
+<div class="card"><div class="number" id="count-pending">{main_counts['Pending']}</div><div class="label">Pending</div></div>
+<div class="card"><div class="number" id="count-interview">{main_counts['Interview']}</div><div class="label">Interview</div></div>
+<div class="card"><div class="number" id="count-applied">{main_counts['Applied']}</div><div class="label">Applied</div></div>
+<div class="card"><div class="number" id="count-rejected">{main_counts['Rejected']}</div><div class="label">Rejected</div></div>
+<div class="card"><div class="number" id="count-offer">{main_counts['Offer']}</div><div class="label">Offer</div></div></div>
+<div class="chart">{status_chart_html}</div><div class="chart">{timeline_chart_html}</div>
 <section class="panel"><h2>Vacancies by company</h2><p class="muted">Grouped overview of consolidated vacancies. Expand or collapse each company.</p>{company_groups_html}</section>
 <div class="table-container"><h2>All applications</h2><p class="muted">Mark an action or interview as completed. A new email in the same application automatically makes it pending again.</p>
-<div class="controls"><input id="global-search" type="search" placeholder="Search all columns…" aria-label="Search all columns"><button type="button" class="clear-button" id="clear-filters">Clear all filters</button><span id="visible-count" aria-live="polite"></span><span id="save-message" aria-live="polite"></span></div>
+<div class="controls" role="search">
+<label class="visually-hidden" for="global-search">Search all applications</label>
+<input id="global-search" type="search" placeholder="Search company, vacancy, status, evidence…" aria-label="Search all columns">
+<button type="button" class="search-button" id="search-button">Search</button>
+<button type="button" class="clear-button" id="clear-filters">Clear search and filters</button>
+<span id="visible-count" aria-live="polite"></span><span id="save-message" aria-live="polite"></span></div>
 <table id="applications-table"><thead><tr>{header_cells}</tr><tr class="filter-row">{filter_cells}</tr></thead><tbody>{rows_html}</tbody></table></div>
-<div class="footer">Source: Google Gmail → Google Sheet → local Python → Ollama<br>Completion states are stored in data/user_actions.json. Keep the local Python server running to save changes.</div></div>
+<div class="footer">Source: Google Gmail → Google Sheet → local Python → Ollama<br>Search, column filters and sorting run entirely in this HTML file and work without the local server. Saving completion states or company/vacancy corrections still requires opening the report with --serve. Data: data/user_actions.json and data/manual_overrides.json.</div></div>
 <script>
 (function() {{
  const table=document.getElementById('applications-table'),tbody=table.querySelector('tbody'),rows=Array.from(tbody.querySelectorAll('tr'));
  const globalSearch=document.getElementById('global-search'),columnFilters=Array.from(document.querySelectorAll('.column-filter'));
  const countLabel=document.getElementById('visible-count'),saveMessage=document.getElementById('save-message');let sortColumn=-1,sortDirection=1;
- function applyFilters() {{ const term=globalSearch.value.trim().toLocaleLowerCase(),filters=columnFilters.map(i=>i.value.trim().toLocaleLowerCase());let visible=0;
- rows.forEach(row=>{{const cells=Array.from(row.cells),globalMatch=!term||row.textContent.toLocaleLowerCase().includes(term),columnMatch=filters.every((f,i)=>!f||(cells[i]&&cells[i].textContent.toLocaleLowerCase().includes(f)));row.hidden=!(globalMatch&&columnMatch);if(!row.hidden)visible++;}});
- countLabel.textContent='Showing '+visible+' of '+rows.length+' applications';}}
+ function applyFilters() {{
+  const term=globalSearch.value.trim().toLocaleLowerCase();
+  const filters=columnFilters.map(input=>input.value.trim().toLocaleLowerCase());
+  let visible=0;
+  rows.forEach(row=>{{
+   const cells=Array.from(row.cells);
+   const globalMatch=!term||row.textContent.toLocaleLowerCase().includes(term);
+   const columnMatch=filters.every((filter,index)=>!filter||(cells[index]&&cells[index].textContent.toLocaleLowerCase().includes(filter)));
+   row.hidden=!(globalMatch&&columnMatch);
+   if(!row.hidden)visible++;
+  }});
+  countLabel.textContent='Showing '+visible+' of '+rows.length+' applications';
+ }}
+ function clearFilters() {{
+  globalSearch.value='';
+  columnFilters.forEach(input=>input.value='');
+  applyFilters();
+  globalSearch.focus();
+ }}
+ function sortTable(column) {{
+  if(column===sortColumn)sortDirection*=-1;else{{sortColumn=column;sortDirection=1;}}
+  const sorted=rows.slice().sort((a,b)=>{{
+   const av=(a.cells[column]?.dataset.value||a.cells[column]?.textContent||'').trim();
+   const bv=(b.cells[column]?.dataset.value||b.cells[column]?.textContent||'').trim();
+   const an=Number(av),bn=Number(bv);
+   const numeric=a.cells[column]?.dataset.type==='number'&&Number.isFinite(an)&&Number.isFinite(bn);
+   const comparison=numeric?(an-bn):av.localeCompare(bv,undefined,{{numeric:true,sensitivity:'base'}});
+   return comparison*sortDirection;
+  }});
+  sorted.forEach(row=>tbody.appendChild(row));
+  applyFilters();
+ }}
+ globalSearch.addEventListener('input',applyFilters);
+ globalSearch.addEventListener('keydown',event=>{{if(event.key==='Enter'){{event.preventDefault();applyFilters();}}}});
+ document.getElementById('search-button').addEventListener('click',applyFilters);
+ document.getElementById('clear-filters').addEventListener('click',clearFilters);
+ columnFilters.forEach(input=>input.addEventListener('input',applyFilters));
+ document.querySelectorAll('.sort-button').forEach(button=>button.addEventListener('click',()=>sortTable(Number(button.dataset.column))));
+ function displayPriority(item) {{
+  if(item.dataset.unrelated==='true')return 5;
+  const status=item.dataset.status||'',task=item.dataset.task||'';
+  if(task==='action'||task==='interview')return (item.dataset.done==='true'||item.dataset.dismissed==='true')?4:0;
+  if(status==='Applied'||status==='Job_Offer')return 1;
+  if(status==='Rejected')return 2;
+  return 3;
+ }}
+ function refreshCompanyGroupOrder() {{
+  const panel=Array.from(document.querySelectorAll('.panel')).find(el=>el.querySelector('.company-group'));
+  if(!panel)return;
+  const groups=Array.from(panel.querySelectorAll('.company-group'));
+  groups.forEach(group=>{{
+   const list=group.querySelector('ul');if(!list)return;
+   const items=Array.from(list.querySelectorAll('li'));
+   items.forEach(item=>item.dataset.priority=String(displayPriority(item)));
+   items.sort((a,b)=>Number(a.dataset.priority)-Number(b.dataset.priority));
+   items.forEach(item=>list.appendChild(item));
+   const priorities=items.map(item=>Number(item.dataset.priority));
+   const priority=priorities.length?Math.min(...priorities):3;
+   group.dataset.priority=String(priority);
+   const pending=items.filter(item=>Number(item.dataset.priority)===0).length;
+   const count=group.querySelector('.company-count');
+   if(count)count.textContent=items.length+' vacancy/vacancies · '+pending+' pending';
+  }});
+  groups.sort((a,b)=>Number(a.dataset.priority)-Number(b.dataset.priority)||a.querySelector('summary strong').textContent.localeCompare(b.querySelector('summary strong').textContent,undefined,{{sensitivity:'base'}}));
+  groups.forEach(group=>panel.appendChild(group));
+ }}
+ refreshCompanyGroupOrder();
+ async function editIdentity(button) {{
+  const company=prompt('Canonical company name:',button.dataset.company||'');if(company===null)return;
+  const position=prompt('Canonical vacancy / job title:',button.dataset.position||'');if(position===null)return;
+  button.disabled=true;saveMessage.textContent='Saving identity correction…';
+  try{{const response=await fetch('/api/identity',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{app_id:button.dataset.appId,company:company.trim(),position:position.trim()}})}});
+   const result=await response.json();if(!response.ok)throw new Error(result.error||'Unable to save identity');
+   saveMessage.textContent='Correction saved. Regrouping applications…';location.reload();
+  }}catch(error){{saveMessage.textContent='Could not save correction: '+error.message;button.disabled=false;}}
+ }}
  function refreshDashboard() {{
   const allRows=Array.from(tbody.querySelectorAll('tr'));
-  const categories=['Applied','Action Required · Pending','Action Required · Completed','Action Required · Dismissed','Interview · Pending','Interview · Completed','Interview · Dismissed','Rejected','Job Offer','Unrelated · Excluded'];
-  const counts={{}};categories.forEach(label=>counts[label]=0);
-  const statusCounts={{Applied:0,Action_Required:0,Interview:0,Rejected:0,Job_Offer:0}};
-  let unrelatedCount=0,activeCount=0;
+  const categories=['Pending','Interview','Applied','Rejected','Offer'];
+  const counts={{Pending:0,Interview:0,Applied:0,Rejected:0,Offer:0}};
+  let totalSubmissions=0;
   const timelineCounts={{}};
-  const taskTotals={{action:0,interview:0}},taskDone={{action:0,interview:0}},taskDismissed={{action:0,interview:0}};
   allRows.forEach(row=>{{
    const unrelated=row.dataset.unrelated==='true',base=row.dataset.baseStatus||'',taskButton=row.querySelector('.task-button'),dismissButton=row.querySelector('.dismiss-button');
-   if(unrelated){{counts['Unrelated · Excluded']++;unrelatedCount++;return;}}
-   activeCount++;
+   if(unrelated)return;
+   totalSubmissions++;
    const activityDate=(row.dataset.lastActivity||'').slice(0,10);
    if(/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(activityDate))timelineCounts[activityDate]=(timelineCounts[activityDate]||0)+1;
-   if(base==='Applied'){{counts['Applied']++;statusCounts.Applied++;}}
-   else if(base==='Rejected'){{counts['Rejected']++;statusCounts.Rejected++;}}
-   else if(base==='Job_Offer'){{counts['Job Offer']++;statusCounts.Job_Offer++;}}
-   else if(base==='Action_Required'||base==='Interview'){{
-    const task=base==='Action_Required'?'action':'interview',prefix=task==='action'?'Action Required':'Interview';
-    statusCounts[base]++;taskTotals[task]++;
-    if(taskButton&&taskButton.dataset.done==='true'){{counts[prefix+' · Completed']++;taskDone[task]++;}}
-    else if(dismissButton&&dismissButton.dataset.done==='true'){{counts[prefix+' · Dismissed']++;taskDismissed[task]++;}}
-    else counts[prefix+' · Pending']++;
+   if(base==='Applied')counts.Applied++;
+   else if(base==='Rejected')counts.Rejected++;
+   else if(base==='Job_Offer')counts.Offer++;
+   else if(base==='Action_Required'){{
+    if(!(taskButton&&taskButton.dataset.done==='true')&&!(dismissButton&&dismissButton.dataset.done==='true'))counts.Pending++;
+   }} else if(base==='Interview'){{
+    if(!(dismissButton&&dismissButton.dataset.done==='true'))counts.Interview++;
    }}
   }});
   const statusChart=document.getElementById('status-chart');
-  if(window.Plotly&&statusChart){{const labels=categories,values=labels.map(label=>counts[label]||0);Plotly.restyle(statusChart,{{x:[labels],y:[values],text:[values]}},[0]);}}
-  const timelineChart=document.querySelector('.chart .plotly-graph-div:not(#status-chart):not(#task-completion-chart)');
+  if(window.Plotly&&statusChart){{const values=categories.map(label=>counts[label]||0);Plotly.restyle(statusChart,{{x:[categories],y:[values],text:[values]}},[0]);}}
+  const timelineChart=document.querySelector('.chart .plotly-graph-div:not(#status-chart)');
   if(window.Plotly&&timelineChart){{const dates=Object.keys(timelineCounts).sort(),values=dates.map(date=>timelineCounts[date]);Plotly.restyle(timelineChart,{{x:[dates],y:[values]}},[0]);}}
-  const completionChart=document.getElementById('task-completion-chart');
-  if(window.Plotly&&completionChart){{
-   const done=[taskDone.action,taskDone.interview],dismissed=[taskDismissed.action,taskDismissed.interview],pending=[taskTotals.action-taskDone.action-taskDismissed.action,taskTotals.interview-taskDone.interview-taskDismissed.interview];
-   Plotly.restyle(completionChart,{{y:[done]}},[0]);Plotly.restyle(completionChart,{{y:[pending]}},[1]);Plotly.restyle(completionChart,{{y:[dismissed]}},[2]);
-  }}
-  const cardValues={{'count-active-applications':activeCount,'count-applied':statusCounts.Applied,'count-action-required':statusCounts.Action_Required,'count-interview':statusCounts.Interview,'count-rejected':statusCounts.Rejected,'count-job-offer':statusCounts.Job_Offer,'count-unrelated':unrelatedCount,'count-actions-completed':taskDone.action,'count-actions-pending':taskTotals.action-taskDone.action-taskDismissed.action,'count-actions-dismissed':taskDismissed.action,'count-interviews-completed':taskDone.interview,'count-interviews-pending':taskTotals.interview-taskDone.interview-taskDismissed.interview,'count-interviews-dismissed':taskDismissed.interview}};
+  const cardValues={{'count-total-submissions':totalSubmissions,'count-pending':counts.Pending,'count-interview':counts.Interview,'count-applied':counts.Applied,'count-rejected':counts.Rejected,'count-offer':counts.Offer}};
   Object.entries(cardValues).forEach(([id,value])=>{{const el=document.getElementById(id);if(el)el.textContent=value;}});
   allRows.forEach(row=>{{
    const cell=row.cells[2];if(!cell)return;const base=row.dataset.baseStatus||'',unrelated=row.dataset.unrelated==='true',taskButton=row.querySelector('.task-button'),dismissButton=row.querySelector('.dismiss-button');
@@ -2550,12 +2805,21 @@ ul {{ margin:0; padding-left:18px; }} a {{ text-decoration:none; }} a:hover {{ t
     if(next){{const row=button.closest('tr'),dismiss=row.querySelector('.dismiss-button');if(dismiss){{dismiss.dataset.done='false';dismiss.classList.remove('dismissed');dismiss.textContent='Dismiss pending';}}}}
    }} else if(button.classList.contains('dismiss-button')){{button.classList.toggle('dismissed',next);button.textContent=next?'Restore pending':'Dismiss pending';if(next){{const row=button.closest('tr'),taskButton=row.querySelector('.task-button');if(taskButton){{taskButton.dataset.done='false';taskButton.classList.remove('done');taskButton.textContent=taskButton.dataset.task==='action'?'Mark action done':'Mark interview done';}}}}}}
    else if(button.classList.contains('unrelated-button')){{const row=button.closest('tr');row.dataset.unrelated=String(next);button.classList.toggle('excluded',next);button.textContent=next?'Restore to tracker':'Mark unrelated';}}
-   refreshDashboard();saveMessage.textContent=button.dataset.task==='unrelated'?(next?'Saved: excluded as unrelated.':'Saved: restored to tracker.'):button.dataset.task.startsWith('dismiss_')?(next?'Saved: follow-up dismissed.':'Saved: follow-up pending again.'):(next?'Saved: marked completed.':'Saved: marked pending.');applyFilters();return true;
+   const row=button.closest('tr');
+   const groupItem=Array.from(document.querySelectorAll('.company-group li')).find(item=>item.dataset.appId===row.dataset.appId);
+   if(groupItem){{
+    groupItem.dataset.unrelated=row.dataset.unrelated||'false';
+    const taskButton=row.querySelector('.task-button'),dismissButton=row.querySelector('.dismiss-button');
+    groupItem.dataset.done=taskButton?taskButton.dataset.done:'false';
+    groupItem.dataset.dismissed=dismissButton?dismissButton.dataset.done:'false';
+   }}
+   refreshDashboard();refreshCompanyGroupOrder();saveMessage.textContent=button.dataset.task==='unrelated'?(next?'Saved: excluded as unrelated.':'Saved: restored to tracker.'):button.dataset.task.startsWith('dismiss_')?(next?'Saved: follow-up dismissed.':'Saved: follow-up pending again.'):(next?'Saved: marked completed.':'Saved: marked pending.');applyFilters();return true;
   }}catch(error){{saveMessage.textContent='Could not save: '+error.message;return false;}}finally{{button.disabled=false;}}
  }}
  document.querySelectorAll('.task-button').forEach(button=>button.addEventListener('click',()=>sendAction(button,button.dataset.done!=='true')));
  document.querySelectorAll('.dismiss-button').forEach(button=>button.addEventListener('click',()=>sendAction(button,button.dataset.done!=='true')));
  document.querySelectorAll('.unrelated-button').forEach(button=>button.addEventListener('click',()=>sendAction(button,button.dataset.done!=='true')));
+ document.querySelectorAll('.identity-button').forEach(button=>button.addEventListener('click',()=>editIdentity(button)));
  refreshDashboard();applyFilters();
 }})();
 </script></body></html>'''
@@ -2589,7 +2853,7 @@ def start_report_server(port=8765):
             return super().do_GET()
 
         def do_POST(self):
-            if self.path != "/api/action":
+            if self.path not in ("/api/action", "/api/identity"):
                 self.send_error(404)
                 return
             try:
@@ -2598,6 +2862,25 @@ def start_report_server(port=8765):
                     raise ValueError("Invalid request size")
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 app_id = clean_text(payload.get("app_id"))
+                current_apps = load_existing_classification()
+                current_app = next((a for a in current_apps if application_id(a) == app_id), None)
+                if current_app is None:
+                    self._json_response(404, {"error": "Application not found. Regenerate the report."})
+                    return
+                if self.path == "/api/identity":
+                    company = clean_text(payload.get("company"))
+                    position = clean_text(payload.get("position"))
+                    if not company or not position:
+                        raise ValueError("Company and vacancy cannot be empty.")
+                    if len(company) > 200 or len(position) > 250:
+                        raise ValueError("Company or vacancy is too long.")
+                    overrides = set_manual_override(current_app, company, position)
+                    apply_manual_overrides(current_apps, overrides)
+                    current_apps = deduplicate_applications(current_apps)
+                    save_classification(current_apps)
+                    generate_html_report(current_apps)
+                    self._json_response(200, {"ok": True, "company": company, "position": position, "applications": len(current_apps)})
+                    return
                 activity_key = clean_text(payload.get("activity_key"))
                 task = clean_text(payload.get("task"))
                 done = bool(payload.get("done"))
@@ -2606,11 +2889,6 @@ def start_report_server(port=8765):
                 if task not in ("action", "interview", "dismiss_action", "dismiss_interview", "unrelated"):
                     raise ValueError("Invalid task")
 
-                current_apps = load_existing_classification()
-                current_app = next((a for a in current_apps if application_id(a) == app_id), None)
-                if current_app is None:
-                    self._json_response(404, {"error": "Application not found. Regenerate the report."})
-                    return
                 expected_status = None
                 if task in ("action", "dismiss_action"):
                     expected_status = "Action_Required"
@@ -2743,7 +3021,8 @@ def reclassify_existing_applications(existing_applications, threads):
         else:
             retained.append(app)
 
-    applications = deduplicate_applications(retained + updated)
+    applications = apply_manual_overrides(retained + updated)
+    applications = deduplicate_applications(applications)
     log(f"   Clasificaciones anteriores reemplazadas: {removed}")
     log(f"   Resultados nuevos de Ollama: {len(updated)}")
     log(f"   Vacantes después de consolidar: {len(applications)}")
@@ -2751,15 +3030,13 @@ def reclassify_existing_applications(existing_applications, threads):
 
 
 def print_summary(applications, report_file, threads_processed=0):
-    counts = {status: 0 for status in ALLOWED_STATUSES}
-    for app in applications:
-        status = clean_text(app.get("status"))
-        if status in counts:
-            counts[status] += 1
+    counts = get_main_status_counts(applications, load_user_actions())
     print("\n==========================================")
     print(" RESUMEN")
     print("==========================================")
-    for status in ["Applied", "Action_Required", "Interview", "Rejected", "Job_Offer"]:
+    total_submissions = get_total_submissions_count(applications, load_user_actions())
+    print(f"{'Total Submissions':18} : {total_submissions}")
+    for status in STATUS_CHART_CATEGORIES:
         print(f"{status:18} : {counts[status]}")
     print(f"\n📊 Reporte: {report_file}")
     print(f"\n📨 Threads procesados en esta ejecución: {threads_processed}")
@@ -2783,6 +3060,11 @@ def main():
         "--serve",
         action="store_true",
         help="After processing, launch the local interactive UI and persist completed actions/interviews.",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Generate the HTML report without opening a browser (for scheduled/headless runs).",
     )
     parser.add_argument(
         "--port",
@@ -2923,6 +3205,13 @@ def main():
         print_summary(applications, report_file, len(reclassified_threads))
         if args.serve:
             start_report_server(args.port)
+        elif not args.no_open:
+            opened = webbrowser.open(REPORT_FILE.as_uri())
+            if not opened:
+                log("⚠️ No se pudo abrir automáticamente el navegador. Abre este archivo manualmente:")
+                log(f"   {REPORT_FILE}")
+        else:
+            log("ℹ️ --no-open activo: el reporte se generó sin abrir el navegador.")
         return
 
     # --------------------------------------------------------
@@ -2974,6 +3263,7 @@ def main():
         )
     )
 
+    applications = apply_manual_overrides(applications)
     before_cleanup = len(applications)
     applications = deduplicate_applications(applications)
     log(f"   Depuración local: {before_cleanup} registros → {len(applications)} vacantes únicas.")
@@ -3033,6 +3323,13 @@ def main():
     print_summary(applications, report_file, len(pending_threads))
     if args.serve:
         start_report_server(args.port)
+    elif not args.no_open:
+        opened = webbrowser.open(REPORT_FILE.as_uri())
+        if not opened:
+            log("⚠️ No se pudo abrir automáticamente el navegador. Abre este archivo manualmente:")
+            log(f"   {REPORT_FILE}")
+    else:
+        log("ℹ️ --no-open activo: el reporte se generó sin abrir el navegador.")
 
 
 if __name__ == "__main__":

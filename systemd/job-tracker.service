@@ -1,0 +1,11 @@
+[Unit]
+Description=Local AI Job Application Tracker
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+TimeoutStopSec=30s
+WorkingDirectory=%h/MEGAsync/Documentos/Job_search/Job2026
+Environment=HOME=%h
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/MEGAsync/Documentos/Job_search/Job2026/script/actualizar_job_tracker.sh --no-open

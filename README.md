@@ -381,6 +381,51 @@ The server binds to `127.0.0.1` in the current implementation, which is intended
 
 If execution fails, review the output and verify the spreadsheet export configuration, Python dependencies, Ollama connectivity, and model availability.
 
+### 8. Schedule daily automation with systemd (Ubuntu)
+
+The repository includes a systemd **user** service and timer. The timer runs daily at midnight in the machine's local timezone, generates the HTML report without opening a browser, and uses the same local configuration and incremental processing workflow as a manual run.
+
+The launcher prefers `BASE_DIR/.venv/bin/python` when that virtual environment exists. Otherwise, it uses `python3` from `PATH`. You can override this with `PYTHON_BIN` in `config/local.sh`.
+
+```bash
+chmod +x script/actualizar_job_tracker.sh
+chmod +x script/install_job_tracker_timer.sh
+./script/install_job_tracker_timer.sh
+```
+
+Check the schedule and run history:
+
+```bash
+systemctl --user list-timers job-tracker.timer --no-pager
+journalctl --user -u job-tracker.service -n 100 --no-pager
+```
+
+Run a test immediately:
+
+```bash
+systemctl --user start job-tracker.service
+```
+
+The user timer normally runs while the user session is active. To let the user systemd manager start at boot and run while logged out, enable lingering (administrator permission required):
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+If Docker Engine is used, ensure its system service starts at boot:
+
+```bash
+sudo systemctl enable --now docker
+```
+
+The service invokes `--no-open`, so it will not attempt to launch a graphical browser. Its start timeout is unlimited to accommodate long Ollama batches. The launcher also uses `flock` to skip overlapping executions. See [`docs/systemd-timer.md`](docs/systemd-timer.md) for prerequisites, operation, and troubleshooting.
+
+To disable the schedule:
+
+```bash
+systemctl --user disable --now job-tracker.timer
+```
+
 ## 📁 Project Structure
 
 ```text
@@ -397,8 +442,14 @@ job-search-ai-tracker/
 │   └── Modelfile_job
 ├── script/
 │   ├── actualizar_job_tracker.sh
+│   ├── install_job_tracker_timer.sh
 │   ├── procesar_job_emails.py
 │   └── bkp/                  # Local backups; excluded from Git
+├── systemd/
+│   ├── job-tracker.service
+│   └── job-tracker.timer
+├── docs/
+│   └── systemd-timer.md
 ├── data/
 │   └── .gitkeep
 ├── reportes/
@@ -412,7 +463,10 @@ Some local files and directories are created at runtime and intentionally exclud
 | Path | Responsibility |
 |---|---|
 | `google-apps-script/job_email_collector.gs` | Collects Gmail messages into Google Sheets and configures scheduled updates. |
-| `script/actualizar_job_tracker.sh` | Coordinates spreadsheet export and local processing. |
+| `script/actualizar_job_tracker.sh` | Coordinates spreadsheet export, Docker/Ollama lifecycle, and local processing; prevents overlapping runs. |
+| `script/install_job_tracker_timer.sh` | Installs and enables the daily systemd user timer. |
+| `systemd/job-tracker.service` / `systemd/job-tracker.timer` | User-level service and daily schedule. |
+| `docs/systemd-timer.md` | Automation setup, operation, and troubleshooting. |
 | `script/procesar_job_emails.py` | Processes email data, coordinates classification, manages local state, generates the report, and provides the local server. |
 | `model/Modelfile_job` | Defines the local Ollama model configuration when used by the setup workflow. |
 | `data/` | Stores source exports, classification results, processing state, and user actions. Private runtime files are excluded from Git. |
@@ -449,6 +503,7 @@ From the project root:
 ```bash
 python3 -m py_compile script/procesar_job_emails.py
 bash -n script/actualizar_job_tracker.sh
+bash -n script/install_job_tracker_timer.sh
 ```
 
 If the virtual environment is active:
@@ -478,45 +533,16 @@ The following roadmap describes project capabilities and possible future work. V
 
 ## 🤝 Contributing
 
-**Contributions and collaboration requests are welcome!**
+Contributions and suggestions are welcome.
 
-This project is currently maintained with controlled access while its documentation, configuration, and workflows are being reviewed. If you are interested in contributing, please contact the repository owner before requesting write access.
+Before submitting changes:
 
-### How to request collaboration
-
-Please contact me through my GitHub profile:
-
-**GitHub:** [@Edbeat15](https://github.com/Edbeat15)
-
-Include the following information in your request:
-
-- **GitHub username:** Your GitHub account.
-- **Introduction:** A brief description of your background and relevant experience.
-- **Area of interest:** The component or area you would like to work on, such as Python, Bash, Google Apps Script, Ollama/LLM classification, reporting, testing, or documentation.
-- **Proposed contribution:** The problem you want to solve, the improvement you suggest, or the issue you would like to investigate.
-- **Relevant experience:** Links to previous projects, contributions, or examples of your work, if available.
-
-Please explain what you intend to change and why it would benefit the project. You do not need to have contributed to an open-source project before to request collaboration.
-
-### Collaboration process
-
-1. Submit a collaboration request with the information above.
-2. Wait for the project owner to review your proposal.
-3. If approved, receive the minimum repository permissions required for the agreed contribution.
-4. Coordinate the scope of the work and review process before making changes.
-
-Access is granted on a case-by-case basis. A collaboration request does not guarantee repository access.
-
-### Security and project guidelines
-
-- Never commit credentials, API keys, access tokens, personal information, or private job-search data.
-- Keep local configuration files, datasets, generated reports, and other private information out of version control.
-- Do not introduce new dependencies, external services, or automated workflows without discussing them first.
-- Explain the purpose and impact of proposed changes, particularly changes involving data handling, external requests, or LLM processing.
-- Test changes before submitting them and document any new configuration requirements.
-- Respect the project's local-first and privacy-oriented design goals.
-
-The project owner reserves the right to approve, decline, limit, or revoke repository access to protect the project and its data.
+1. Do not commit personal or confidential recruitment data.
+2. Use synthetic messages when testing classification rules.
+3. Keep credentials and local configuration outside the repository.
+4. Validate Python and Bash syntax.
+5. Document changes to the Google Apps Script, spreadsheet schema, and local export workflow.
+6. Keep the README synchronized with changes to folder names, spreadsheet names, and configuration options.
 
 ## 📄 License
 
