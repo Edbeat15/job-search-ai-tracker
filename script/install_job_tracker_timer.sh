@@ -3,17 +3,14 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-UNIT_SOURCE_DIR="$PROJECT_DIR/systemd"
+PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="$PROJECT_DIR/config/local.sh"
 UNIT_TARGET_DIR="$HOME/.config/systemd/user"
-
-SERVICE_SOURCE="$UNIT_SOURCE_DIR/job-tracker.service"
-TIMER_SOURCE="$UNIT_SOURCE_DIR/job-tracker.timer"
 SERVICE_TARGET="$UNIT_TARGET_DIR/job-tracker.service"
 TIMER_TARGET="$UNIT_TARGET_DIR/job-tracker.timer"
 
-if [[ ! -f "$PROJECT_DIR/config/local.sh" ]]; then
-    echo "ERROR: Missing $PROJECT_DIR/config/local.sh" >&2
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: Missing $CONFIG_FILE" >&2
     echo "Create it from config/local.example.sh and configure rclone first." >&2
     exit 1
 fi
@@ -25,33 +22,62 @@ if [[ ! -x "$PROJECT_DIR/script/actualizar_job_tracker.sh" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$SERVICE_SOURCE" || ! -f "$TIMER_SOURCE" ]]; then
-    echo "ERROR: systemd unit templates not found in $UNIT_SOURCE_DIR" >&2
+# Load local settings. The schedule is deliberately configurable locally,
+# while the installer resolves the repository path automatically.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+JOB_TRACKER_SCHEDULE="${JOB_TRACKER_SCHEDULE:-*-*-* 09:00:00}"
+
+if ! systemd-analyze calendar "$JOB_TRACKER_SCHEDULE" >/dev/null; then
+    echo "ERROR: Invalid JOB_TRACKER_SCHEDULE: $JOB_TRACKER_SCHEDULE" >&2
+    echo 'Use a systemd calendar expression, e.g. "*-*-* 09:00:00".' >&2
     exit 1
 fi
 
 mkdir -p "$UNIT_TARGET_DIR"
-install -m 0644 "$SERVICE_SOURCE" "$SERVICE_TARGET"
-install -m 0644 "$TIMER_SOURCE" "$TIMER_TARGET"
+
+cat > "$SERVICE_TARGET" <<EOF_SERVICE
+[Unit]
+Description=Local AI Job Application Tracker
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+TimeoutStopSec=30s
+WorkingDirectory=$PROJECT_DIR
+Environment=HOME=%h
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$PROJECT_DIR/script/actualizar_job_tracker.sh --no-open
+EOF_SERVICE
+
+cat > "$TIMER_TARGET" <<EOF_TIMER
+[Unit]
+Description=Run the Local AI Job Application Tracker daily
+
+[Timer]
+OnCalendar=$JOB_TRACKER_SCHEDULE
+Persistent=false
+AccuracySec=1min
+Unit=job-tracker.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
 
 systemctl --user daemon-reload
 systemctl --user enable --now job-tracker.timer
 
-echo
-echo "Timer installed and enabled."
-echo "Next scheduled execution:"
+printf '\nTimer installed and enabled.\n'
+printf 'Project:  %s\n' "$PROJECT_DIR"
+printf 'Schedule: %s (machine local timezone)\n' "$JOB_TRACKER_SCHEDULE"
+printf '\nNext scheduled execution:\n'
 systemctl --user list-timers job-tracker.timer --no-pager
 
-echo
-echo "To inspect the latest run:"
-echo "  journalctl --user -u job-tracker.service -n 100 --no-pager"
-echo
-echo "To run once immediately:"
-echo "  systemctl --user start job-tracker.service"
-echo
-echo "To disable the timer:"
-echo "  systemctl --user disable --now job-tracker.timer"
-echo
-echo "This is a user-level timer. It normally runs while your user session is active."
-echo "For runs while logged out, enable lingering if your system policy allows it:"
-echo "  sudo loginctl enable-linger \"$USER\""
+printf '\nTo inspect the latest run:\n'
+printf '  journalctl --user -u job-tracker.service -n 100 --no-pager\n'
+printf '\nTo run once immediately:\n'
+printf '  systemctl --user start job-tracker.service\n'
+printf '\nTo disable the timer:\n'
+printf '  systemctl --user disable --now job-tracker.timer\n'
+printf '\nThe timer runs under your user session. Lingering is not required\n'
+printf 'and is intentionally not enabled by this installer.\n'
