@@ -15,3 +15,9 @@ RCLONE_FILE_PATH="Job2026/Job_Emails_2026.xlsx"
 # Optional: explicit Python interpreter. If omitted, the launcher uses
 # BASE_DIR/.venv/bin/python when available, otherwise python3 from PATH.
 # PYTHON_BIN="$HOME/path/to/job-search-ai-tracker/.venv/bin/python"
+
+# Daily systemd user-timer schedule (machine local timezone).
+# Default: every day at 09:00. Examples:
+#   JOB_TRACKER_SCHEDULE="*-*-* 09:00:00"  # daily at 9 AM
+#   JOB_TRACKER_SCHEDULE="Mon..Fri 09:00" # weekdays at 9 AM
+JOB_TRACKER_SCHEDULE="*-*-* 09:00:00"
