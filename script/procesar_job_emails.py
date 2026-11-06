@@ -1332,10 +1332,30 @@ def validate_classification(
 
         if not thread_ref:
 
-            raise ValueError(
-                "Una clasificación "
-                "no tiene thread_ref."
-            )
+            # Safe recovery:
+            # When the batch contains exactly one thread,
+            # its generated reference is unambiguously T1.
+            if (
+                len(source_threads) == 1
+                and len(applications) == 1
+            ):
+
+                thread_ref = "T1"
+
+                app["thread_ref"] = thread_ref
+
+                log(
+                    "⚠️ Ollama omitió thread_ref. "
+                    "Se asignó T1 porque el batch "
+                    "contiene un único thread."
+                )
+
+            else:
+
+                raise ValueError(
+                    "Una clasificación "
+                    "no tiene thread_ref."
+                )
 
         if thread_ref not in (
             expected_refs
